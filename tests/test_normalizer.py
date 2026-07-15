@@ -146,3 +146,38 @@ def test_normalize_requires_completed_turn(tmp_path):
 
     with pytest.raises(NormalizationError, match="no complete end_turn"):
         normalize_jsonl(path)
+
+
+def test_normalize_accepts_exported_messages_and_keeps_final_answer(tmp_path):
+    path = tmp_path / "conversation.json"
+    path.write_text(
+        json.dumps(
+            {
+                "conversation": {"id": "conversation-1"},
+                "messages": [
+                    {"role": "user", "content": "第一个问题"},
+                    {"role": "assistant", "content": "处理中"},
+                    {
+                        "role": "assistant",
+                        "content": "最终答案，路径 /Users/alice/project；Bearer abcdefgh",
+                    },
+                    {"role": "user", "content": "这个方案不对"},
+                    {"role": "assistant", "content": "修正后的答案"},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    corpus = normalize_jsonl(path)
+
+    assert corpus.source.record_count == 5
+    assert corpus.sessions[0].session_id == "conversation-1"
+    assert [turn.request_id for turn in corpus.sessions[0].turns] == [
+        "message-0003",
+        "message-0005",
+    ]
+    first, correction = corpus.sessions[0].turns
+    assert first.answer == "最终答案，路径 ~/project；Bearer [REDACTED]"
+    assert correction.kind == TurnKind.CORRECTION

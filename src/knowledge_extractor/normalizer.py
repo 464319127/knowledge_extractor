@@ -89,42 +89,41 @@ def _extract_answer(record: dict[str, Any]) -> tuple[str | None, str | None]:
     return answer, str(response_id) if response_id else None
 
 
-def _read_records(path: Path) -> tuple[list[tuple[int, dict[str, Any]]], str, int]:
-    records: list[tuple[int, dict[str, Any]]] = []
-    digest = hashlib.sha256()
-    byte_count = 0
-
+def _read_bytes(path: Path) -> tuple[bytes, str, int]:
     try:
-        handle = path.open("rb")
+        raw = path.read_bytes()
     except OSError as exc:
         raise NormalizationError(f"cannot read input file {path}: {exc}") from exc
+    return raw, hashlib.sha256(raw).hexdigest(), len(raw)
 
-    with handle:
-        for line_number, raw_line in enumerate(handle, start=1):
-            digest.update(raw_line)
-            byte_count += len(raw_line)
-            if not raw_line.strip():
-                continue
-            try:
-                value = json.loads(raw_line)
-            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-                raise NormalizationError(
-                    f"invalid JSON on line {line_number}: {exc}"
-                ) from exc
-            if not isinstance(value, dict):
-                raise NormalizationError(
-                    f"line {line_number} must contain a JSON object"
-                )
-            records.append((line_number, value))
+
+def _read_records(raw: bytes) -> list[tuple[int, dict[str, Any]]]:
+    records: list[tuple[int, dict[str, Any]]] = []
+    for line_number, raw_line in enumerate(raw.splitlines(), start=1):
+        if not raw_line.strip():
+            continue
+        try:
+            value = json.loads(raw_line)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise NormalizationError(
+                f"invalid JSON on line {line_number}: {exc}"
+            ) from exc
+        if not isinstance(value, dict):
+            raise NormalizationError(f"line {line_number} must contain a JSON object")
+        records.append((line_number, value))
 
     if not records:
         raise NormalizationError("input contains no JSON records")
-    return records, digest.hexdigest(), byte_count
+    return records
 
 
-def normalize_jsonl(path: str | Path) -> NormalizedCorpus:
-    source_path = Path(path)
-    records, sha256, byte_count = _read_records(source_path)
+def _normalize_records(
+    records: list[tuple[int, dict[str, Any]]],
+    *,
+    source_name: str,
+    sha256: str,
+    byte_count: int,
+) -> NormalizedCorpus:
     sessions: OrderedDict[str, list[NormalizedTurn]] = OrderedDict()
     session_models: dict[str, str | None] = {}
     seen_request_ids: set[tuple[str, str]] = set()
@@ -192,11 +191,135 @@ def normalize_jsonl(path: str | Path) -> NormalizedCorpus:
     ]
     return NormalizedCorpus(
         source=SourceMetadata(
-            name=source_path.name,
+            name=source_name,
             sha256=sha256,
             record_count=len(records),
             byte_count=byte_count,
         ),
         sessions=normalized_sessions,
         warnings=warnings,
+    )
+
+
+def _normalize_messages(
+    document: dict[str, Any],
+    *,
+    source_name: str,
+    sha256: str,
+    byte_count: int,
+) -> NormalizedCorpus:
+    messages = document.get("messages")
+    if not isinstance(messages, list):
+        raise NormalizationError("messages document must contain a list")
+
+    conversation = document.get("conversation")
+    conversation_id = document.get("conversation_id")
+    if isinstance(conversation, dict):
+        conversation_id = conversation.get("id") or conversation_id
+    session_id = str(conversation_id or f"conversation-{sha256[:12]}").strip()
+    if not session_id:
+        raise NormalizationError("messages document has an empty conversation id")
+
+    turns: list[NormalizedTurn] = []
+    warnings: list[str] = []
+    pending_question: str | None = None
+    pending_question_index: int | None = None
+    latest_answer: str | None = None
+    latest_answer_index: int | None = None
+
+    def finish_pending() -> None:
+        nonlocal pending_question, pending_question_index
+        nonlocal latest_answer, latest_answer_index
+        if pending_question is None:
+            return
+        if latest_answer is None or latest_answer_index is None:
+            warnings.append(
+                f"message {pending_question_index}: user question has no assistant answer"
+            )
+        else:
+            request_id = f"message-{latest_answer_index:04d}"
+            kind = (
+                TurnKind.CORRECTION
+                if _CORRECTION_RE.search(pending_question)
+                else TurnKind.COMPLETED
+            )
+            turns.append(
+                NormalizedTurn(
+                    request_id=request_id,
+                    response_id=None,
+                    source_line=latest_answer_index,
+                    question=pending_question,
+                    answer=latest_answer,
+                    kind=kind,
+                )
+            )
+        pending_question = None
+        pending_question_index = None
+        latest_answer = None
+        latest_answer_index = None
+
+    for message_index, message in enumerate(messages, start=1):
+        if not isinstance(message, dict):
+            warnings.append(f"message {message_index}: skipped non-object message")
+            continue
+        role = message.get("role")
+        texts = _text_blocks(message.get("content"), sanitize=True)
+        if role == "user":
+            finish_pending()
+            if texts:
+                pending_question = "\n\n".join(texts)
+                pending_question_index = message_index
+            else:
+                warnings.append(f"message {message_index}: skipped empty user message")
+        elif role == "assistant" and pending_question is not None and texts:
+            # Exported conversations may contain progress updates; retain only the
+            # final assistant text before the next user question.
+            latest_answer = "\n\n".join(texts)
+            latest_answer_index = message_index
+
+    finish_pending()
+    if not turns:
+        raise NormalizationError(
+            "input contains no complete user/assistant message pairs"
+        )
+
+    return NormalizedCorpus(
+        source=SourceMetadata(
+            name=source_name,
+            sha256=sha256,
+            record_count=len(messages),
+            byte_count=byte_count,
+        ),
+        sessions=[
+            NormalizedSession(
+                session_id=session_id,
+                model=None,
+                turns=turns,
+            )
+        ],
+        warnings=warnings,
+    )
+
+
+def normalize_jsonl(path: str | Path) -> NormalizedCorpus:
+    """Normalize cumulative JSONL or export-conversation messages JSON."""
+    source_path = Path(path)
+    raw, sha256, byte_count = _read_bytes(source_path)
+    try:
+        document = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        document = None
+    if isinstance(document, dict) and "messages" in document:
+        return _normalize_messages(
+            document,
+            source_name=source_path.name,
+            sha256=sha256,
+            byte_count=byte_count,
+        )
+    records = _read_records(raw)
+    return _normalize_records(
+        records,
+        source_name=source_path.name,
+        sha256=sha256,
+        byte_count=byte_count,
     )

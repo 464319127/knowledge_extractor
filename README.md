@@ -23,11 +23,17 @@ python3 -m venv .venv
   --out staging/example/normalized.json
 ```
 
+`normalize` 也接受 `export-conversation` 生成的便携 `conversation.json`。它会按
+用户问题分组，每组只保留最后一条助手文本，生成稳定的消息位置来源 ID；两种输入
+都会使用同一套脱敏和后续审核流程。
+
 输出只包含：
 
 - `end_turn` 完整问答；
 - `session_id`、`request_id`、来源行和源文件 SHA-256；
 - 清洗后的真实用户问题和最终回答。
+
+对于便携 `messages` 输入，没有 `stop_reason`，因此按用户问题分组并保留每组最后一条助手文本。
 
 不会保留 `thinking`、`cot_plaintext`、签名、系统提示、工具定义、工具调用和工具结果。
 

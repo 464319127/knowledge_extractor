@@ -43,7 +43,11 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     normalize = commands.add_parser(
-        "normalize", help="Convert cumulative API JSONL into sanitized Q/A turns."
+        "normalize",
+        help=(
+            "Convert cumulative API JSONL or export-conversation messages JSON "
+            "into sanitized Q/A turns."
+        ),
     )
     normalize.add_argument("input", type=Path)
     normalize.add_argument("--out", required=True, type=Path)
